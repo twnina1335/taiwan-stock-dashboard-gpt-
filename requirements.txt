@@ -1,0 +1,6 @@
+streamlit>=1.40,<2
+pandas>=2.2,<3
+requests>=2.32,<3
+filelock>=3.16,<4
+altair>=5,<7
+tzdata>=2025.1

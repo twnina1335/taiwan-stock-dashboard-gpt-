@@ -280,13 +280,124 @@ def temperature(values):
     if b<=a and c<=b:return '🔵 持續降溫'
     return '🟠 回升' if c>b else '🟣 回落'
 
-def advice(total,parts):
+def breakout_observation(hist, market_ret20, market_ret60, peer_ret20, peer_ret60, F):
+    """只使用評分日以前資料；突破基準在突破日鎖定，不逐日抬高重設。"""
+    a=hist.sort_values('date').reset_index(drop=True)
+    x=a.iloc[-1];active=None;last_failure=None
+    # 近10個交易日找首次突破；有效突破維持原基準，失敗後才允許新事件。
+    for i in range(max(60,len(a)-10),len(a)):
+        bar=a.iloc[i]
+        if active is not None:
+            if bar.adj_close<active['level']:
+                last_failure={**active,'failed_on':bar.date,'failed_index':i}
+                active=None
+            else:
+                continue
+        prior=a.iloc[i-60:i]
+        level=float(prior.adj_high.max())
+        if bar.adj_close>level and a.iloc[i-1].adj_close<=level:
+            baseline=float(a.iloc[i-20:i].volume.mean())
+            span=float(bar.adj_high-bar.adj_low)
+            active={'index':i,'date':bar.date,'level':level,'atr':float(bar.atr),
+                    'volume':float(bar.volume),'volume_ratio':float(bar.volume/baseline) if baseline>0 else 0,
+                    'close_location':float((bar.adj_close-bar.adj_low)/span) if span>0 else 0}
+    trend=bool(x.ma20>x.ma60 and x.ma20>a.iloc[-21].ma20 and x.ma60>a.iloc[-21].ma60)
+    relative=bool(x.ret20>market_ret20 and x.ret60>market_ret60 and
+                  x.ret20>peer_ret20 and x.ret60>peer_ret60)
+    data={'active':active,'trend':trend,'relative':relative,'confirmed':False,'strong':False,
+          'failed':False,'retest':'尚未觀察','status':'趨勢強，尚無近期突破' if trend else '未見創高延續條件',
+          'reasons':[],'F_support':F>=75}
+    if active is None:
+        if last_failure is not None and len(a)-1-last_failure['failed_index']<=4:
+            data.update(failed=True,status='突破失敗警示',event=last_failure,
+                        reasons=['於'+str(last_failure['failed_on'])+'收盤跌回已鎖定的突破基準價'])
+        return data
+    confirmed=len(a)-active['index']>=2
+    volume_ok=active['volume_ratio']>=1.2
+    close_ok=active['close_location']>=.7
+    reasons=[]
+    checks={'均線持續上升':trend,'相對大盤與同業強勢':relative,'突破量至少前20日均量1.2倍':volume_ok,
+            '突破收盤位於當日區間上方30%':close_ok,'營運F至少75分':F>=75}
+    reasons=[name+'未符合' for name,ok in checks.items() if not ok]
+    if not confirmed:reasons.insert(0,'尚未連續兩日收盤守住突破區')
+    # 回測不是必要條件；尚未出現不當作失敗。先有量縮回測、後有收盤回升才確認。
+    retest='尚未觀察'
+    for i in range(active['index']+1,len(a)):
+        bar=a.iloc[i];avg=a.iloc[max(0,i-20):i].volume.mean()
+        touch=bar.adj_low<=active['level']+.5*active['atr'] and bar.adj_close>=active['level']
+        if touch and bar.volume<active['volume'] and bar.volume<avg:
+            retest='量縮回測中'
+            if i<len(a)-1 and (a.iloc[i+1:].adj_close>bar.adj_close).any():
+                retest='量縮回測後回升';break
+    data.update(confirmed=confirmed,strong=bool(all(checks.values())),retest=retest,reasons=reasons,
+                volume_ok=volume_ok,close_ok=close_ok)
+    data['status']='突破待確認' if not confirmed else '突破已站穩，延續條件未齊'
+    return data
+
+
+def risk_assessment(hist, observation):
+    """回檔用前高目標與RR；突破用失效位置與風險距離，不虛構上方目標。"""
+    a=hist.sort_values('date').reset_index(drop=True);x=a.iloc[-1];prior=a.iloc[:-1]
+    scale=float(x.close/x.adj_close);entry=float(x.close);atr=float(x.atr*scale)
+    event=observation.get('active')
+    if event is None:
+        stop=float(prior.adj_low.tail(20).min()*scale-.5*atr)
+        target=float(prior.adj_high.tail(60).max()*scale)
+        risk=entry-stop;cost=entry*(2*.001425+.003+.001)
+        rr=(target-entry-cost)/(risk+cost) if target>entry and stop>0 and risk>0 else None
+        R=score4([rr>=2,rr>=3,risk<=2*atr,risk/entry<=.08]) if rr is not None else 0
+        return R,{'評估路徑':'回檔型','參考停損':round(stop,2),'參考目標':round(target,2) if target>entry else None,
+                  '扣成本風報比':round(rr,2) if rr is not None else None,'追價過遠':False,
+                  'R說明':'前60日高點為目標；無可用上方目標則回檔型R=0' if rr is None else '前20日低點減0.5ATR為停損；前60日高點為目標',
+                  '突破風控通過':False,'移動保護參考價':None,'風控未符合':''}
+    level=event['level']*scale
+    stop=(event['level']-.5*event['atr'])*scale
+    distance=entry-stop
+    valid=bool(stop>0 and distance>0 and atr>0)
+    risk_atr=valid and distance<=2*atr
+    risk_pct=valid and distance/entry<=.08
+    near_level=valid and entry-level<=2*atr
+    near_ma=valid and abs(float(x.adj_close-x.ma20))*scale<=3*atr
+    R=score4([risk_atr,risk_pct,near_level,near_ma]) if valid else 0
+    # 四項距離條件均為突破進場必要條件；其他高分不能抵銷追價風險。
+    gate=bool(valid and risk_atr and risk_pct and near_level and near_ma)
+    guards=[stop]
+    for i in range(event['index']+1,len(a)):
+        window=a.iloc[max(0,i-10):i]
+        guard=(float(window.adj_low.min())-.5*float(a.iloc[i-1].atr))*scale
+        guards.append(guard)
+    protected=max(guards)
+    if protected>=entry:gate=False
+    reasons=[name for name,ok in [('停損位置有效',valid),('停損距離不超過2ATR',risk_atr),('停損距離不超過8%',risk_pct),('現價離突破區不超過2ATR',near_level),('現價離MA20不超過3ATR',near_ma),('現價仍高於移動保護參考價',protected<entry)] if not ok]
+    return R,{'評估路徑':'突破型','參考停損':round(stop,2),'參考目標':None,'扣成本風報比':None,
+              '追價過遠':bool(valid and not (risk_atr and risk_pct and near_level and near_ma)),
+              '突破風控通過':gate,'移動保護參考價':round(protected,2),
+              'R說明':'突破型無歷史上方目標：以突破價減0.5個突破日ATR為失效停損；R檢查風險距離，非獲利預測',
+              '風控未符合':'；'.join(reasons),'停損距離ATR':round(distance/atr,2) if atr>0 else None,
+              '距突破價ATR':round((entry-level)/atr,2) if atr>0 else None}
+
+
+def advice(total,parts,observation=None,risk=None):
+    observation=observation or {};risk=risk or {}
+    if observation.get('failed'):
+        return '突破失敗，暫不追價','檢查停損與交易理由；不因警示一律賣出'
+    if risk.get('評估路徑')=='突破型':
+        if not observation.get('confirmed'):
+            return '突破待確認，等待收盤站穩','觀察能否守住突破區'
+        if observation.get('strong') and risk.get('追價過遠'):
+            return '強勢，等待回檔','續抱檢查移動保護價；不因過熱自動賣出'
+        if not observation.get('strong'):
+            return '突破已站穩，延續條件未齊','核對量能、相對強弱及營運支持'
+        if not risk.get('突破風控通過'):
+            return '突破風控未通過，等待','檢查失效位置及移動保護價'
     if total<60:return '不進場','依退出規則評估'
     if total<70:return '不進場','減碼評估'
     if total<80:return '觀察','續抱檢查'
     if parts['M']<50 or min(parts[k] for k in ['F','T','R'])<75:
         return '高分但未通過必要條件','檢查風報及持有理由'
-    return ('試單候選' if total<85 else '分批建倉候選' if total<90 else '完整建倉候選'),'續抱；加碼須另通過風控'
+    label='試單候選' if total<85 else '分批建倉候選' if total<90 else '完整建倉候選'
+    return ('突破型／' if risk.get('評估路徑')=='突破型' else '回檔型／')+label,'續抱；加碼須另通過風控'
+
 
 def stock_score(code,dt,prices,index,companies,rev,profit,val,flow):
     hist=prices[(prices.code==code)&(prices.date<=dt)].sort_values('date')
@@ -318,22 +429,21 @@ def stock_score(code,dt,prices,index,companies,rev,profit,val,flow):
     net20=f.foreign.sum()+f.trust.sum();net5=f.tail(5).foreign.sum()+f.tail(5).trust.sum()
     denom=last.volume.sum()
     parts['H']=score4([f.foreign.sum()>0,f.trust.sum()>0,net5>0,denom>0 and net20/denom>=.01])
-    # 比較價先換回評分日可交易價尺度，再算參考停損與目標。
-    scale=x.close/x.adj_close;atr=x.atr*scale
-    previous=hist.iloc[:-1]
-    stop=float(previous.adj_low.tail(20).min()*scale-.5*atr)
-    target=float(previous.adj_high.tail(60).max()*scale)
-    entry=float(x.close);risk=entry-stop;cost=entry*(2*.001425+.003+.001)
-    if target<=entry or stop<=0 or risk<=0:
-        rr=None;parts['R']=0
-    else:
-        rr=(target-entry-cost)/(risk+cost)
-        parts['R']=score4([rr>=2,rr>=3,risk<=2*atr,risk/entry<=.08])
+    observation=breakout_observation(hist,r20,r60,float(peer.ret20.median()),float(peer.ret60.median()),F)
+    parts['R'],risk=risk_assessment(hist,observation)
+    if observation.get('active') and observation['confirmed'] and observation['strong']:
+        observation['status']='強勢，等待回檔' if risk['追價過遠'] else ('創高延續候選' if risk['突破風控通過'] else '突破風控未通過')
     total=round(sum(WEIGHTS[k]*parts[k]/100 for k in WEIGHTS),2)
-    buy,hold=advice(total,parts)
-    meta.update({'市場廣度樣本':len(cross),'產業樣本':len(peer),'收盤':entry,'參考停損':round(stop,2),
-                 '參考目標':round(target,2) if target>entry else None,'扣成本風報比':round(rr,2) if rr is not None else None,
-                 'R說明':'前60日高點未高於現價，沒有可用上方目標，R=0' if target<=entry else '以前20日低點減0.5ATR為停損，前60日高點為目標',
+    buy,hold=advice(total,parts,observation,risk)
+    event=observation.get('active') or observation.get('event')
+    scale=float(x.close/x.adj_close)
+    meta.update({'市場廣度樣本':len(cross),'產業樣本':len(peer),'收盤':float(x.close),**risk,
+                 '創高觀察':observation['status'],'均線延續':observation['trend'],'相對強勢':observation['relative'],
+                 '營運支持':observation['F_support'],'回測承接':observation['retest'],
+                 '突破站穩':observation['confirmed'],'突破日':str(event['date']) if event else None,
+                 '突破基準價':round(event['level']*scale,2) if event else None,
+                 '突破日量比':round(event['volume_ratio'],2) if event else None,
+                 '未符合條件':'；'.join(observation['reasons']),
                  '未持有':buy,'已持有':hold})
     return total,parts,meta
 
@@ -364,6 +474,9 @@ def batch(rows,dates,prices,index,context,is_etf=False):
             record.update({'三日圖':values,'當日分數':values[-1],'近三日平均':round(sum(values)/3,2),'三日變化':round(values[-1]-values[0],2),
                            '狀態':temperature(values),'未持有':meta['未持有'],'已持有':meta['已持有'],'評分日':str(dates[-1]),
                            '日期序列':' → '.join(str(x) for x in dates),'分數序列':' → '.join(str(x) for x in values)})
+            if not is_etf:
+                for k in ['創高觀察','評估路徑','突破基準價','突破站穩','回測承接','參考停損','移動保護參考價','未符合條件','風控未符合']:
+                    record[k]=meta.get(k)
         except (SourceError,KeyError,ValueError) as exc:
             record.update({'狀態':'無法評分','錯誤':str(exc)})
         results.append(record)
@@ -371,6 +484,8 @@ def batch(rows,dates,prices,index,context,is_etf=False):
 
 def display_results(table,detail,key):
     if table.empty:st.info('本區沒有標的');return
+    priority=['code','name','創高觀察','評估路徑','當日分數','三日圖','近三日平均','狀態','未持有','已持有']
+    table=table[[k for k in priority if k in table]+[k for k in table if k not in priority]]
     st.dataframe(table,use_container_width=True,hide_index=True,column_config={
         '三日圖':st.column_config.LineChartColumn('近三日升降溫',y_min=0,y_max=100,width='medium'),
         '當日分數':st.column_config.NumberColumn(format='%.2f'),
@@ -381,6 +496,10 @@ def display_results(table,detail,key):
         with st.expander('八面向／ETF分項、價格與資料日期'):
             code=st.selectbox('選擇代碼',list(dict.fromkeys(detail['代碼'])),key=key+'_select')
             chosen=detail[detail['代碼']==code]
+            if '創高觀察' in chosen:
+                latest=chosen.iloc[-1]
+                st.write('最新創高觀察：'+str(latest['創高觀察'])+'｜'+str(latest['評估路徑']))
+                st.caption('延續條件未符合：'+(str(latest.get('未符合條件','')) or '無')+'；風控未符合：'+(str(latest.get('風控未符合','')) or '無'))
             chart=alt.Chart(chosen.assign(日期=pd.to_datetime(chosen['日期']))).mark_line(point=True).encode(
                 x=alt.X('日期:T',title='評分日期'),y=alt.Y('總分:Q',scale=alt.Scale(domain=[0,100])),tooltip=['日期:T','總分:Q'])
             st.altair_chart(chart,use_container_width=True)
@@ -390,7 +509,8 @@ def display_results(table,detail,key):
 def main():
     st.set_page_config(page_title='台股波段｜公開免費版',layout='wide')
     st.title('台股波段｜公開免費官方資料版')
-    st.caption('免帳號、免token；事件面向已移除。個股八面向；ETF獨立公式。未回測，分數不代表勝率。')
+    st.caption('V3-Free＋突破觀察｜免帳號、免token。回檔與突破分路徑風控，個股八面向權重不變，ETF公式不變。未回測，分數不代表勝率。')
+    st.info('創高觀察與進場結論分開：可能強勢但需等待回檔。突破型不設虛構目標價，也不以創高直接把R歸零；R採不同規則，跨路徑分數不能當相同風報。')
     st.warning('三日個股分數為「以最新公開基本面與估值橫截面重估」：不是當時已知資訊的歷史回測。比較價依官方收盤價及參考價重建，不是供應商總報酬還原價。')
     with st.sidebar:
         st.header('查詢設定')

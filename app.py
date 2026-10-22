@@ -16,7 +16,7 @@ API='https://openapi.twse.com.tw/v1'
 RWD='https://www.twse.com.tw/rwd/zh'
 HOME='https://www.twse.com.tw/res/data/zh/home/values.json'
 WEIGHTS={'M':10,'I':15,'F':23,'V':5,'T':22,'L':10,'H':5,'R':10}
-MODEL_VERSION='V5.1-Compact-Definitions'
+MODEL_VERSION='V5.2-Independent-Sections'
 MAX_STOP_PCT=.08
 MAX_ENTRY_EXTENSION_ATR=3.0
 MIN_PULLBACK_RR=2.0
@@ -235,7 +235,7 @@ def homepage(client):
     rows=rows[['code','name','首頁名次','市值億元','排名日']]
     return rows,day
 
-def lists(client,companies,funds):
+def market_stocks(client,companies,funds):
     rows,day=homepage(client)
     etf_ids=set(funds.loc[funds['基金類型'].astype(str).str.contains('交易所交易基金|指數股票型|ETF',regex=True),'基金代號'])
     company_ids=set(companies['公司代號'])
@@ -243,6 +243,9 @@ def lists(client,companies,funds):
     if unknown:raise SourceError('首頁商品無法分類：'+','.join(sorted(unknown)))
     moved=rows[rows.code.isin(etf_ids)].copy();stocks=rows[rows.code.isin(company_ids)].copy()
     if len(stocks)+len(moved)!=20:raise SourceError('首頁商品分類不唯一')
+    return stocks,day
+
+def popular_etfs(client):
     d=snapshot(client,'/ETFReport/ETFRank')
     required={'ETFsSecurityCode','ETFsName','ETFsNumberofTradingAccounts'}
     if not required<=set(d):raise SourceError('定期定額ETF排行格式改變')
@@ -255,7 +258,12 @@ def lists(client,companies,funds):
     # 首頁榜ETF只從第二區排除，不額外加入第三區。獨立入選定期定額榜者仍保留。
     etfs=popular.drop_duplicates('code',keep='first').reset_index(drop=True)
     if len(etfs)!=15:raise SourceError('定期定額排行代碼重複，未取得15檔唯一ETF。')
-    return stocks,etfs,day
+    return etfs
+
+def lists(client,companies,funds):
+    # 相容既有資料驗證；主畫面按鈕各自呼叫獨立來源。
+    stocks,day=market_stocks(client,companies,funds)
+    return stocks,popular_etfs(client),day
 
 def merge_etfs(popular,moved):
     result=[]
@@ -1108,10 +1116,78 @@ def display_definitions():
 
 所有參數與判讀是自訂規則，未完成策略回測；不代表上漲機率或保證報酬。
 '''}
-    with st.expander('計算定義與判讀說明'):
-        tabs=st.tabs(list(content))
-        for tab,text in zip(tabs,content.values()):
-            with tab:st.markdown(text)
+    with st.expander('名詞與計算說明'):
+        level=st.radio('說明方式',['白話速讀','完整公式'],horizontal=True,key='help_level',label_visibility='collapsed')
+        if level=='白話速讀':
+            brief={
+            '分數怎麼看':r"""
+| 項目 | 一句話看懂 |
+|---|---|
+| 股票強度 | 看大盤、產業、營運、估值、趨勢、量能與法人 |
+| ETF強度 | 只看走勢、漲勢與成交量 |
+| 綜合分 | 股票另含進場品質；ETF另含穩定程度 |
+| 三日均分 | 最近三個交易日強度的平均 |
+| 升溫／降溫 | 分數走高／走低，不是股價預測 |
+
+**強度高，不等於現在就能買；股票與ETF分數不能直接相比。**
+
+| 股票面向 | 看什麼 |
+|---|---|
+| 大盤／產業 | 市場與同業是否強勢 |
+| 營運／估值 | 營收獲利、價格相對同業高低 |
+| 趨勢／量能 | 股價方向、成交是否活躍 |
+| 籌碼 | 外資與投信的買賣方向 |
+| 進場品質 | 買點遠近與停損距離 |
+""",
+            '常用名詞':r"""
+| 名詞 | 白話意思 |
+|---|---|
+| 月線 MA20 | 最近20交易日的平均價 |
+| 季線 MA60 | 最近60交易日的平均價 |
+| ATR | 平常一天大約波動多大，包含跳空 |
+| 乖離 | 現價離均線有多遠 |
+| 動能 | 最近價格上漲的力道 |
+| 量縮／放量 | 成交量變少／變多 |
+| 突破 | 股價站上先前高點 |
+| 回檔 | 上漲後暫時回落 |
+| 止跌確認 | 程式看到回升條件，不保證不再跌 |
+| 風報比 RR | 參考獲利空間÷停損風險，已扣成本 |
+| 保護價 | 提醒你檢查持倉的參考防守價 |
+| 折溢價 | ETF市價低於／高於淨值 |
+""",
+            '提示怎麼看':r"""
+| 顯示文字 | 白話意思 |
+|---|---|
+| 位置可評估 | 距月線未過遠，仍要檢查其他條件 |
+| 回檔位置可評估 | 參考風報比達標，還要等止跌 |
+| 離均線偏遠 | 漲離均線較遠，先別急著追 |
+| 風控通過 | 停損有效且距離未超標，不保證不虧 |
+| 趨勢延續型 | 趨勢還在，但尚未形成本模型的買點 |
+| 試單／分批／標準候選 | 模型分級，不是買進指令或資金比例 |
+| 未持有 | 看是否值得進一步評估進場 |
+| 已持有 | 看續抱、停損或減碼是否需要檢查 |
+
+ETF每列的「原因」會說明為何得到該提示；完整判斷順序請切換「完整公式」。
+""",
+            '盤中與資料':r"""
+| 項目 | 你要知道的事 |
+|---|---|
+| 盤中暫估 | 尚未收盤，今天突破還不能算確認 |
+| 強度區間 | 固定現價，讓未定的量能條件變動 |
+| 法人／大盤／同業 | 盤中沿用收盤基準，不是假裝即時 |
+| 資料快照 | 營收、財報與估值用最新已取得資料 |
+| 三日重估 | 共用最新快照，不是歷史回測 |
+| 快取 | 已下載資料先保存，下次少抓一次 |
+
+盤中需手動刷新；缺資料不補假分數。ETF提示未納入折溢價等產品風險。
+"""}
+            tabs=st.tabs(list(brief))
+            for tab,text in zip(tabs,brief.values()):
+                with tab:st.markdown(text)
+        else:
+            tabs=st.tabs(list(content))
+            for tab,text in zip(tabs,content.values()):
+                with tab:st.markdown(text)
 
 
 def main():
@@ -1156,13 +1232,13 @@ def main():
     single=one or intraday_one
     st.markdown('#### 第二區｜市值榜股票')
     st.caption('原榜20筆排除ETF，不補名額。')
-    both=st.button('更新第二、三區')
+    update_stocks=st.button('更新第二區')
     second_slot=st.container()
     st.markdown('#### 第三區｜定期定額ETF前15')
     st.caption('依交易戶數排名；不額外加入市值榜ETF。')
     only_etf=st.button('更新第三區')
     third_slot=st.container()
-    if single or both or only_etf:
+    if single or update_stocks or only_etf:
         notice=st.empty()
         try:
             c.progress=notice.info
@@ -1188,17 +1264,19 @@ def main():
                         row=b.iloc[0];selected=pd.DataFrame([{'code':str(row['基金代號']),'name':row['基金簡稱']}]);is_etf=True
                     if intraday_one:rankday=today()-timedelta(days=1)
                     else:_,rankday=homepage(c)
+                elif update_stocks:
+                    stocks,rankday=market_stocks(c,companies,funds)
                 else:
-                    stocks,etfs,rankday=lists(c,companies,funds)
-                if cutoff<rankday and (both or only_etf):raise SourceError('首頁榜單僅最新快照，請選最新截止日，不能當歷史排名')
-                now=datetime.now(ZoneInfo('Asia/Taipei'));end=min(cutoff,rankday)
+                    etfs=popular_etfs(c);rankday=None
+                if update_stocks and cutoff<rankday:raise SourceError('首頁榜單僅最新快照，請選最新截止日，不能當歷史排名')
+                now=datetime.now(ZoneInfo('Asia/Taipei'));end=min(cutoff,rankday) if rankday is not None else cutoff
                 if end==today() and now.hour<21:end-=timedelta(days=1)
                 raw,index=history(c,end,notice.info,refresh_recent=refresh_recent);prices=comparable(raw)
                 dates=list(index.index[-3:])
-                need_stock=both or (single and not is_etf)
+                need_stock=update_stocks or (single and not is_etf)
                 if need_stock:
                     notice.info('補齊營收、營益、估值與法人資料（已下載日期直接沿用）…')
-                    codes=list(stocks.code) if both else list(selected.code)
+                    codes=list(stocks.code) if update_stocks else list(selected.code)
                     rev,profit,val=fundamentals(c,companies,codes)
                     flow=chips(c,list(index.index[-22:]),refresh_recent=refresh_recent)
                 else:rev=profit=val=flow=pd.DataFrame()
@@ -1208,14 +1286,14 @@ def main():
                     quote=load_intraday_quote(c,str(selected.iloc[0].code))
                     st.session_state['intraday_output']=intraday_estimate(str(selected.iloc[0].code),dates[-1],prices,index,context,quote,is_etf)
                 if one:st.session_state.outputs['第一區']=batch(selected,dates,prices,index,context,is_etf)
-                if both:st.session_state.outputs['第二區']=batch(stocks,dates,prices,index,context)
-                if both or only_etf:st.session_state.outputs['第三區']=batch(etfs,dates,prices,index,context,True)
+                if update_stocks:st.session_state.outputs['第二區']=batch(stocks,dates,prices,index,context)
+                if only_etf:st.session_state.outputs['第三區']=batch(etfs,dates,prices,index,context,True)
                 st.session_state['sources']=c.observed
                 downloaded=sum(x['模式']=='新下載' for x in c.observed)
                 reused=len(c.observed)-downloaded
                 if downloaded:st.session_state.pop('cache_backup',None)
                 st.session_state['speed_note']=f'本次成功下載{downloaded}次、失敗嘗試{len(c.failures)}次、快取命中{reused}次。歷史資料未強制複查時沿用原值；官方更正可勾選複查。'
-                st.session_state['data_note']=f'行情與籌碼基準日：{dates[-1]}；三日收盤：'+ '、'.join(map(str,dates))+(f'；首頁排名日：{rankday}' if not intraday_one else '；盤中預估與收盤結果分開顯示')+'；基本面為本次可取得最新快照。'
+                st.session_state['data_note']=f'行情與籌碼基準日：{dates[-1]}；三日收盤：'+ '、'.join(map(str,dates))+('；盤中預估與收盤結果分開顯示' if intraday_one else f'；首頁排名日：{rankday}' if rankday is not None else '；ETF名單依最新定期定額月報')+'；基本面為本次可取得最新快照。'
             notice.success('完成')
         except (SourceError,ValueError,KeyError,requests.RequestException) as exc:
             notice.error(str(exc))

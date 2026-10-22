@@ -4,6 +4,7 @@ import hashlib, io, json, math, re, sqlite3, time, zipfile
 from datetime import datetime, timedelta, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from urllib.parse import urlsplit
 import pandas as pd
 import requests
 import streamlit as st
@@ -15,7 +16,7 @@ API='https://openapi.twse.com.tw/v1'
 RWD='https://www.twse.com.tw/rwd/zh'
 HOME='https://www.twse.com.tw/res/data/zh/home/values.json'
 WEIGHTS={'M':10,'I':15,'F':23,'V':5,'T':22,'L':10,'H':5,'R':10}
-MODEL_VERSION='V4-Strength-Position-Risk'
+MODEL_VERSION='V5-Intraday-Preview'
 MAX_STOP_PCT=.08
 MAX_ENTRY_EXTENSION_ATR=3.0
 MIN_PULLBACK_RR=2.0
@@ -27,7 +28,7 @@ class Client:
     """跨程序序列化；磁碟快取；15秒最小間隔；200次/日；限制即停止。"""
     def __init__(self, offline=False):
         self.offline = offline
-        self.observed=[]
+        self.observed=[];self.failures=[];self.progress=None
         self.seed_note=bootstrap_seed()
     def get(self, url, params=None, method='GET', ttl=86400):
         # 所有來源為官方公開資料，不使用token
@@ -52,23 +53,45 @@ class Client:
                 def write(k,v): db.execute('INSERT OR REPLACE INTO control VALUES (?,?)',(k,str(v)))
                 if float(read('blocked_until',0)) > time.time():
                     raise Halt('來源先前回覆限制或拒絕，已停止全體網路請求；冷卻期尚未結束。')
-                day=today().isoformat(); count=int(read('count:'+day,0))
-                if count >= 200: raise Halt('本機今日200次請求預算用完，請明日再試。')
-                time.sleep(max(0,15-(time.time()-float(read('last',0)))))
+                endpoint=urlsplit(url).netloc+urlsplit(url).path
+                query_date=str((params or {}).get('date','')) if isinstance(params,dict) else ''
+                label=endpoint+(' 日期='+query_date if query_date else '')
                 headers={'User-Agent':'TaiwanWaveDashboard/1.0 (personal research; cached; rate-limited)'}
-                write('last',time.time());write('count:'+day,count+1);db.commit()
-                try:
-                    r=requests.request(method,url,params=params if method=='GET' else None,
-                                       data=params if method=='POST' else None,headers=headers,timeout=(10,30))
-                except requests.RequestException:
-                    raise SourceError('網路連線失敗；不自動重試，稍後手動再試。') from None
+                # 最多三次；每次實際嘗試均計入預算。POST與SSL錯誤不自動重試。
+                attempts=3 if method=='GET' else 1
+                for attempt in range(attempts):
+                    if float(read('blocked_until',0))>time.time():
+                        raise Halt('來源冷卻期尚未結束；已停止請求。')
+                    day=today().isoformat();count=int(read('count:'+day,0))
+                    if count>=200:raise Halt('本機今日200次請求預算用完；已保存的快取不受影響。')
+                    interval=[15,30,60][attempt]
+                    time.sleep(max(0,interval-(time.time()-float(read('last',0)))))
+                    write('last',time.time());write('count:'+day,count+1);db.commit()
+                    if self.progress:
+                        self.progress(f'連線 {attempt+1}/{attempts}：{label}'+('；暫時失敗後退避重試' if attempt else ''))
+                    try:
+                        r=requests.request(method,url,params=params if method=='GET' else None,
+                                           data=params if method=='POST' else None,headers=headers,timeout=(15,60))
+                        break
+                    except requests.RequestException as exc:
+                        if isinstance(exc,requests.exceptions.SSLError):reason='SSL憑證／安全連線失敗';retryable=False
+                        elif isinstance(exc,requests.exceptions.ConnectTimeout):reason='建立連線逾時';retryable=True
+                        elif isinstance(exc,requests.exceptions.ReadTimeout):reason='等待來源資料逾時';retryable=True
+                        elif isinstance(exc,requests.exceptions.Timeout):reason='連線／讀取逾時';retryable=True
+                        elif isinstance(exc,requests.exceptions.ConnectionError):reason='無法連線（可能為DNS、連線重設或代理連線問題）';retryable=True
+                        else:reason='請求失敗（'+type(exc).__name__+'）';retryable=False
+                        self.failures.append({'來源':endpoint,'查詢日期':query_date,'嘗試次數':attempt+1,
+                                              '原因':reason,'時間UTC':datetime.now(ZoneInfo('UTC')).isoformat()})
+                        if not retryable or attempt+1>=attempts:
+                            raise SourceError(f'{reason}；已嘗試{attempt+1}次。來源：{label}。'
+                                              '已成功下載資料仍在快取；稍後重新按查詢即可續補，這則訊息不代表已確認IP遭封鎖。') from None
                 if r.status_code in (401,402,403,429):
                     write('blocked_until',time.time()+86400);db.commit()
-                    raise Halt(f'來源回覆HTTP {r.status_code}；全體請求停止24小時，請稍後再試。')
+                    raise Halt(f'來源回覆HTTP {r.status_code}；程式停止全體請求24小時（本機保護設定，非官方封鎖期限）。來源：{label}')
                 if r.status_code >= 500:
                     write('blocked_until',time.time()+900);db.commit()
-                    raise Halt('來源伺服器異常；停止請求15分鐘。')
-                if not r.ok: raise SourceError(f'來源回覆HTTP {r.status_code}，不重試。')
+                    raise Halt('來源伺服器異常；程式停止請求15分鐘。來源：'+label+'。')
+                if not r.ok: raise SourceError(f'來源回覆HTTP {r.status_code}，不重試。來源：{label}')
                 r.encoding='utf-8';body=r.text
                 db.execute('INSERT OR REPLACE INTO cache VALUES (?,?,?)',(key,time.time(),body));db.commit()
                 self.observed.append({'來源':url,'原始擷取時間UTC':datetime.now(ZoneInfo('UTC')).isoformat(),'模式':'新下載'})
@@ -702,12 +725,203 @@ def display_results(table,detail,key):
             st.dataframe(chosen,hide_index=True,use_container_width=True)
             st.download_button('下載分項CSV',detail.to_csv(index=False).encode('utf-8-sig'),file_name=key+'_detail.csv',key=key+'_detail')
 
+# 盤中只查單檔；MIS為公開網站報價回應，非具可用性承諾的OpenAPI。
+MIS='https://mis.twse.com.tw/stock/api/getStockInfo.jsp'
+
+def parse_intraday_quote(payload,code,now=None):
+    now=now or datetime.now(ZoneInfo('Asia/Taipei'))
+    now=now.astimezone(ZoneInfo('Asia/Taipei'))
+    rows=payload.get('msgArray') if isinstance(payload,dict) else None
+    if not isinstance(rows,list):raise SourceError('盤中來源未回傳行情陣列；不以收盤價或買賣掛單價替代。')
+    matches=[r for r in rows if str(r.get('c',''))==str(code) and r.get('ex')=='tse']
+    if len(matches)!=1:raise SourceError('沒有唯一的上市盤中報價；可能休市、停牌或來源拒絕，未產生預估分。')
+    r=matches[0]
+    try:stamp=datetime.strptime(str(r['d'])+' '+str(r['t']),'%Y%m%d %H:%M:%S').replace(tzinfo=ZoneInfo('Asia/Taipei'))
+    except (KeyError,ValueError):raise SourceError('盤中報價時間缺少／格式改變；停止評分。') from None
+    if stamp.date()!=now.date():raise SourceError('盤中來源不是今天的資料；不把舊報價當即時行情。')
+    minute=now.hour*60+now.minute
+    if now.weekday()>=5 or not 540<=minute<810:
+        raise SourceError('目前非一般盤中時段09:00–13:30；請使用收盤模式。休市與特殊交易另以來源為準。')
+    age=(now-stamp).total_seconds()
+    # 收盤前五分鐘最後成交可能停在13:25；不使用試撮價替代實際成交。
+    auction=minute>=805
+    max_age=420 if auction else 180
+    if age < -60 or age>max_age:
+        raise SourceError(f'報價時間落後約{max(0,age)/60:.1f}分鐘或超前，超過本模式接受範圍；未產生預估分。')
+    values={k:number(r.get(k)) for k in ['z','o','h','l','y','v']}
+    if any(pd.isna(v) or not math.isfinite(v) or v<=0 for v in values.values()):
+        raise SourceError('盤中成交價／OHLC／昨參考價／累計量無效；不改拿買賣掛單或昨收充數。')
+    if not (values['l']<=min(values['o'],values['z'])<=max(values['o'],values['z'])<=values['h']):
+        raise SourceError('盤中高低價與成交價不一致，暫停評分。')
+    # MIS一般整股v為累計張數；本程式上市普通股／ETF每張1000股，與日報股數統一。
+    return {'code':str(code),'time':stamp,'fetched_at':now,'age_seconds':max(0,age),
+            'price':values['z'],'open':values['o'],'high':values['h'],'low':values['l'],
+            'reference':values['y'],'volume':values['v']*1000,
+            'phase':'收盤集合競價，僅參考最後成交' if auction else '開盤前30分鐘，訊號不穩定' if minute<570 else '一般盤中',
+            'auction':auction,'early':minute<570}
+
+
+def load_intraday_quote(client,code,now=None):
+    if not re.fullmatch(r'[0-9A-Z]{4,8}',str(code)):raise SourceError('盤中證券代碼格式不符。')
+    if client.offline:raise SourceError('盤中模式不能使用離線快取；可改用收盤模式。')
+    requested_now=now
+    now=now or datetime.now(ZoneInfo('Asia/Taipei'))
+    minute=now.hour*60+now.minute
+    if now.weekday()>=5 or not 540<=minute<810:raise SourceError('目前非一般盤中時段09:00–13:30，未向盤中來源發出請求。')
+    payload=js(client,MIS,{'ex_ch':'tse_'+str(code)+'.tw','json':'1','delay':'0'},ttl=60)
+    return parse_intraday_quote(payload,code,now=requested_now or datetime.now(ZoneInfo('Asia/Taipei')))
+
+
+def intraday_bar(hist,quote):
+    """只暫估一根日K；ATR固定使用上個完整日，避免半日波幅縮小風險尺度。"""
+    a=hist.sort_values('date').reset_index(drop=True).copy();prev=a.iloc[-1]
+    if quote['time'].date()<=prev.date:raise SourceError('盤中日期未晚於收盤基準；避免同一天重複加入日K。')
+    if abs(quote['reference']/float(prev.close)-1)>.001:
+        raise SourceError('盤中昨參考價與收盤基準不符，可能缺少交易日或遇除權息／公司行動；先補齊比較價，暫不預估。')
+    factor=float(prev.adj_close)/quote['reference']
+    row=prev.to_dict();row.update(date=quote['time'].date(),close=quote['price'],open=quote['open'],
+                                 high=quote['high'],low=quote['low'],reference=quote['reference'],volume=quote['volume'])
+    for col,key in [('close','price'),('open','open'),('high','high'),('low','low')]:row['adj_'+col]=quote[key]*factor
+    for n in [20,60]:
+        row['ma'+str(n)]=(a['adj_close'].tail(n-1).sum()+row['adj_close'])/n
+        row['ret'+str(n)]=row['adj_close']/a.iloc[-n].adj_close-1
+    row['atr']=float(prev.atr) # 固定完整日ATR；不是當天完整ATR
+    row['money']=float('nan');row['money5']=float('nan');row['money20']=float('nan')
+    row['change']=row['adj_close']-prev.adj_close
+    return pd.concat([a,pd.DataFrame([row])],ignore_index=True)
+
+
+def intraday_liquidity_bounds(hist,quote,setup,observation,is_etf=False):
+    """固定當前價格，只對尚未確定的當日量能條件給可變範圍；不是收盤信賴區間。"""
+    a=hist.sort_values('date');past19=float(a.money.tail(19).sum());past4=float(a.money.tail(4).sum())
+    # 成交金額未直接取得，以日內最低價×已成交股數作已發生金額下界；不是精確成交額。
+    amount_floor=quote['low']*quote['volume']
+    min20=(past19+amount_floor)/20
+    min5_ge20=3*amount_floor>=past19-4*past4
+    def uncertain(proven):return (25,25) if proven else (0,25)
+    bounds=[uncertain(min20>=1e8)]
+    if is_etf:
+        bounds+=[uncertain(min20>=5e8),uncertain(min5_ge20),(0,25)]
+    else:
+        traded=bool((a.volume.tail(19)>0).all() and quote['volume']>0)
+        bounds.append((25,25) if traded else (0,0))
+        if setup=='突破型':
+            bounds.append(uncertain(min5_ge20))
+            event=observation.get('active')
+            if event and event['date']<quote['time'].date():
+                points=25 if event['volume_ratio']>=1.2 else 0;bounds.append((points,points))
+            else:bounds.append(uncertain(quote['volume']>=1.2*a.volume.tail(20).mean()))
+        elif setup=='回檔型':bounds.extend([(0,25),(0,25)])
+        else:bounds.extend([uncertain(min5_ge20),(0,25)])
+    return sum(x[0] for x in bounds),sum(x[1] for x in bounds)
+
+
+def intraday_estimate(code,dt,prices,index,context,quote,is_etf=False):
+    hist=prices[(prices.code==code)&(prices.date<=dt)].sort_values('date').reset_index(drop=True)
+    if len(hist)<81 or hist.date.iloc[-1]!=dt:raise SourceError('盤中模式也需要完整的前一交易日基準與至少81日行情。')
+    live=intraday_bar(hist,quote);x=live.iloc[-1];old=live.iloc[-21]
+    ratio=quote['volume']/hist.volume.tail(20).mean()
+    common={'代碼':code,'模式':'盤中暫估，非收盤分','收盤基準日':str(dt),
+            '報價時間':quote['time'].isoformat(),'查詢時間':quote['fetched_at'].isoformat(),
+            '報價落後秒數':round(quote['age_seconds'],1),'時段':quote['phase'],
+            '最後成交價':quote['price'],'累計成交股數':int(quote['volume']),
+            '累計量／前20日全天均量':round(float(ratio),3),
+            '量能說明':'此比例僅代表已成交量；沒有同時段歷史量，不線性推估全天量，也不以未完成量當作量縮。',
+            'ATR使用日':str(dt),'估算MA20':round(float(x.ma20*x.close/x.adj_close),2),
+            '估算MA60':round(float(x.ma60*x.close/x.adj_close),2),
+            '公司行動限制':'只檢查昨參考價一致性；不是完整公司行動驗證。'}
+    if is_etf:
+        _,base,meta=etf_score(code,dt,prices)
+        trend=score4([x.adj_close>x.ma20,x.adj_close>x.ma60,x.ma20>x.ma60,x.ma60>old.ma60])
+        momentum=score4([x.ret20>0,x.ret60>0,x.adj_close>live.adj_close.tail(20).median(),x.adj_close>live.adj_close.tail(60).median()])
+        lo,hi=intraday_liquidity_bounds(hist,quote,'ETF',{},True)
+        low=round((.4*trend+.25*momentum+.2*lo)/.85,2);high=round((.4*trend+.25*momentum+.2*hi)/.85,2)
+        detail=[{'面向':'趨勢','分數／區間':str(trend),'資料狀態':'盤中價格暫估'},
+                {'面向':'動能','分數／區間':str(momentum),'資料狀態':'盤中價格暫估'},
+                {'面向':'量能','分數／區間':f'{lo}–{hi}','資料狀態':'未定條件列範圍，不假設全天成交量'},
+                {'面向':'價格穩定','分數／區間':str(base['價格穩定']),'資料狀態':'維持收盤基準；不混入ETF技術強度'}]
+        common.update({'強度下緣':low,'強度上緣':high,'觀察結論':'ETF盤中技術觀察；不套用個股進場門檻',
+                       '前收盤強度':meta['ETF技術強度'],'進場位置':'另查淨值折溢價與產品風險','風控結果':'本模式未評估ETF產品風險'})
+    else:
+        companies,rev,profit,val,flow=context
+        _,parts,meta=stock_score(code,dt,prices,index,companies,rev,profit,val,flow)
+        peers=set(companies.loc[companies['產業別'].astype(str)==str(companies.loc[companies['公司代號']==code,'產業別'].iloc[0]),'公司代號'])-{code}
+        cross=prices[(prices.date==dt)&prices.code.isin(peers)]
+        ic=index.loc[:dt].close;r20=ic.iloc[-1]/ic.iloc[-21]-1;r60=ic.iloc[-1]/ic.iloc[-61]-1
+        obs=breakout_observation(hist,r20,r60,float(cross.ret20.median()),float(cross.ret60.median()),parts['F'])
+        already=obs.get('active');level=float(hist.adj_high.tail(60).max())
+        triggered=already is None and x.adj_close>level
+        if triggered:
+            span=x.adj_high-x.adj_low
+            obs.update(active={'index':len(hist),'date':quote['time'].date(),'level':level,'atr':float(hist.iloc[-1].atr),
+                               'volume':quote['volume'],'volume_ratio':float(ratio),
+                               'close_location':float((x.adj_close-x.adj_low)/span) if span>0 else 0,
+                               'consolidation':False},confirmed=False,strong=False)
+        # 三項價格趨勢重算；相對大盤條件沿用同日收盤對照，不把今日個股與昨日指數硬比。
+        parts['T']=score4([x.adj_close>x.ma60,x.ma20>x.ma60,hist.iloc[-1].ret60>r60,x.ma20>old.ma20])
+        parts['R'],risk=risk_assessment(live,obs)
+        lo,hi=intraday_liquidity_bounds(hist,quote,risk['評估路徑'],obs)
+        fixed=sum(WEIGHTS[k]*parts[k] for k in WEIGHTS if k not in {'R','L'})
+        low=round((fixed+WEIGHTS['L']*lo)/90,2);high=round((fixed+WEIGHTS['L']*hi)/90,2)
+        under=bool(already and x.adj_close<already['level'])
+        conclusion='盤中觀察；需待收盤確認'
+        if quote['early']:conclusion='開盤前30分鐘，只觀察，不做進場確認'
+        elif quote['auction']:conclusion='收盤集合競價中，等待實際收盤成交'
+        elif obs.get('failed'):conclusion='前收盤有突破失敗警示，盤中僅觀察'
+        elif under:conclusion='盤中跌回突破基準，核對原停損；尚非收盤失敗確認'
+        elif not risk['風控通過']:conclusion='盤中風控未通過，等待'
+        elif high<80:conclusion='盤中強度情境仍低於80，觀察'
+        elif low<80:conclusion='量能情境跨越80分，尚不足以確認'
+        elif parts['M']<50 or parts['T']<75:conclusion='前收盤大盤／盤中趨勢條件未齊'
+        elif not risk['位置通過']:conclusion='盤中強度較高，但進場位置待改善'
+        elif risk['評估路徑'] not in {'回檔型','突破型'}:conclusion='趨勢觀察，尚無可辨識的進場型態'
+        else:conclusion='盤中候選觀察，等待收盤與正式資料確認'
+        detail=[]
+        for k in WEIGHTS:
+            status={'M':'前收盤大盤與廣度','I':'前收盤同業行情','F':'本次最新營收／財報快照',
+                    'V':'最新官方估值快照，未按盤中價格重算','T':'3項盤中暫估；相對大盤維持前收盤對照',
+                    'L':'量能尚未完成；分數區間不是收盤預測','H':'前收盤法人；不推測今日法人',
+                    'R':'當下位置＋前收盤ATR；不是收盤買點確認'}[k]
+            detail.append({'面向':NAMES[k],'分數／區間':f'{lo}–{hi}' if k=='L' else str(parts[k]),'資料狀態':status})
+        common.update({'強度下緣':low,'強度上緣':high,'前收盤強度':meta['股票強度'],
+                       '觀察結論':conclusion,'進場位置':risk['進場位置'],'風控結果':risk['風控結果'],
+                       '參考停損':risk['參考停損'],'風控未符合':risk['風控未符合'],
+                       '營收年月':meta.get('營收年月',''),'財報年度':meta.get('財報年度',''),'財報季別':meta.get('財報季別',''),
+                       '估值資料日':meta.get('估值資料日',''),'法人／大盤／同業基準日':str(dt),
+                       '盤中型態':risk['評估路徑'],'今日突破':'盤中觸發，當日未收盤' if triggered else '沿用既有事件／尚未觸發',
+                       '前收盤已確認突破':bool(already and obs['confirmed'])})
+    common['區間定義']='固定此刻價格與已知基準，只讓未定量能條件變動；不是未來收盤分數信賴區間。'
+    return common,pd.DataFrame(detail)
+
+
+def display_intraday(result,detail):
+    st.subheader('第一區｜盤中預估（獨立於三日收盤圖）')
+    st.caption('這是上次按下盤中預估時的快照，不會自動更新；報價落後秒數以當次查詢時計。請核對下方報價時間。')
+    stamp=datetime.fromisoformat(result['報價時間'])
+    snapshot_age=(datetime.now(ZoneInfo('Asia/Taipei'))-stamp).total_seconds()
+    if snapshot_age>180:
+        st.warning(f'這份報價距現在約{snapshot_age/60:.1f}分鐘；可能為舊快照或集合競價期間最後成交，請勿當作目前即時狀態。')
+    st.warning('非即時交易等級資訊、非收盤確認。大盤／同業／法人採前收盤，最新基本面與估值另有資料日期；不把混合時間的估分稱為全市場即時評分。')
+    st.write('**'+result['觀察結論']+'**')
+    a,b,c=st.columns(3)
+    a.metric('盤中強度：量能情境區間',f"{result['強度下緣']:.2f}–{result['強度上緣']:.2f}")
+    b.metric('前收盤強度',f"{result['前收盤強度']:.2f}")
+    c.metric('最後成交價',str(result['最後成交價']))
+    st.caption('報價時間：'+result['報價時間']+'｜'+result['時段']+'｜收盤基準：'+result['收盤基準日'])
+    st.info(result['區間定義'])
+    st.caption(result['量能說明'])
+    st.dataframe(detail,hide_index=True,use_container_width=True)
+    with st.expander('盤中價位、量能、資料時間與限制'):
+        st.dataframe(pd.DataFrame([result]),hide_index=True,use_container_width=True)
+    st.download_button('下載盤中預估CSV',pd.DataFrame([result]).to_csv(index=False).encode('utf-8-sig'),file_name='intraday_estimate.csv',key='intraday_csv')
+
+
 def main():
     st.set_page_config(page_title='台股波段｜公開免費版',layout='wide')
     if st.session_state.get('model_version')!=MODEL_VERSION:
-        st.session_state.pop('outputs',None);st.session_state['model_version']=MODEL_VERSION
+        st.session_state.pop('outputs',None);st.session_state.pop('intraday_output',None);st.session_state['model_version']=MODEL_VERSION
     st.title('台股波段｜公開免費官方資料版')
-    st.caption('V4｜股票強度、進場位置、風控分開。八面向權重保留；進場分級改依不含R的股票強度。未回測，分數不代表勝率。')
+    st.caption('V5｜股票強度、進場位置、風控分開。八面向權重保留；進場分級改依不含R的股票強度。未回測，分數不代表勝率。')
     st.info('先看股票強度，再看型態、位置與風控。F與R不再有75分否決門檻；突破量價證據用於分級。綜合分與股票強度不同，新舊分數不可直接比較。')
     st.caption('T只評趨勢；回檔量縮與突破放量分開計分。ATR改用Wilder14。股價過熱不直接視為賣出；實際持倉須核對原停損。')
     st.warning('三日個股分數為「以最新公開基本面與估值橫截面重估」：不是當時已知資訊的歷史回測。比較價依官方收盤價及參考價重建，不是供應商總報酬還原價。')
@@ -739,19 +953,30 @@ def main():
                 st.download_button('下載data_cache.zip',st.session_state['cache_backup'],file_name='data_cache.zip',mime='application/zip')
     st.subheader('第一區｜股票中文名稱／代碼')
     query=st.text_input('上市股票完整簡稱或代碼，例如台積電、2330')
-    one=st.button('計算這一檔')
+    one=st.button('計算這一檔（收盤）')
+    intraday_one=st.button('盤中預估這一檔（手動刷新，報價快取60秒）')
+    st.caption('盤中預估僅第一區單檔；第二、三區維持收盤評分。不自動輪詢，未接可靠同時段歷史量之前，不以線性放大量當作全天量。')
+    single=one or intraday_one
     st.subheader('第二區｜首頁市值榜20筆中的非ETF')
     st.caption('直接取首頁原榜，保留名次與日期；ETF移到第三區，不補名額。')
     both=st.button('更新第二區與第三區')
     st.subheader('第三區｜定期定額前15 ETF＋首頁榜移入ETF')
     st.caption('按代碼合併去重。保留ETF綜合分，另列排除穩定分的ETF技術強度與ATR波動%；不同產品風險不可只按綜合分比較。')
     only_etf=st.button('僅更新第三區')
-    if one or both or only_etf:
+    if single or both or only_etf:
         notice=st.empty()
         try:
+            c.progress=notice.info
+            if intraday_one:
+                st.session_state.pop('intraday_output',None)
+                live_now=datetime.now(ZoneInfo('Asia/Taipei'))
+                if cutoff!=today():raise SourceError('盤中預估請將截止日設為今天。')
+                if offline:raise SourceError('盤中預估不能使用離線模式。')
+                if live_now.weekday()>=5 or not 540<=live_now.hour*60+live_now.minute<810:
+                    raise SourceError('目前非一般盤中時段09:00–13:30，請使用收盤模式。')
             with st.spinner('讀取公開資料與快取；首次建立歷史較久，可保留視窗等待。'):
-                companies,funds=registry(c,include_funds=not one,refresh=refresh_recent)
-                if one:
+                companies,funds=registry(c,include_funds=not single,refresh=refresh_recent)
+                if single:
                     q=query.strip()
                     a=companies[(companies['公司代號']==q)|(companies['公司簡稱']==q)]
                     if len(a)==1:
@@ -762,7 +987,8 @@ def main():
                         b=funds[(funds['基金代號']==q)|(funds['基金簡稱']==q)]
                         if len(b)!=1:raise SourceError('查無唯一上市名稱／代碼，目前未支援上櫃與興櫃')
                         row=b.iloc[0];selected=pd.DataFrame([{'code':str(row['基金代號']),'name':row['基金簡稱']}]);is_etf=True
-                    _,rankday=homepage(c)
+                    if intraday_one:rankday=today()-timedelta(days=1)
+                    else:_,rankday=homepage(c)
                 else:
                     stocks,etfs,rankday=lists(c,companies,funds)
                 if cutoff<rankday and (both or only_etf):raise SourceError('首頁榜單僅最新快照，請選最新截止日，不能當歷史排名')
@@ -770,7 +996,7 @@ def main():
                 if end==today() and now.hour<21:end-=timedelta(days=1)
                 raw,index=history(c,end,notice.info,refresh_recent=refresh_recent);prices=comparable(raw)
                 dates=list(index.index[-3:])
-                need_stock=both or (one and not is_etf)
+                need_stock=both or (single and not is_etf)
                 if need_stock:
                     notice.info('補齊營收、營益、估值與法人資料（已下載日期直接沿用）…')
                     codes=list(stocks.code) if both else list(selected.code)
@@ -779,6 +1005,9 @@ def main():
                 else:rev=profit=val=flow=pd.DataFrame()
                 context=(companies,rev,profit,val,flow)
                 if 'outputs' not in st.session_state:st.session_state.outputs={}
+                if intraday_one:
+                    quote=load_intraday_quote(c,str(selected.iloc[0].code))
+                    st.session_state['intraday_output']=intraday_estimate(str(selected.iloc[0].code),dates[-1],prices,index,context,quote,is_etf)
                 if one:st.session_state.outputs['第一區']=batch(selected,dates,prices,index,context,is_etf)
                 if both:st.session_state.outputs['第二區']=batch(stocks,dates,prices,index,context)
                 if both or only_etf:st.session_state.outputs['第三區']=batch(etfs,dates,prices,index,context,True)
@@ -786,11 +1015,19 @@ def main():
                 downloaded=sum(x['模式']=='新下載' for x in c.observed)
                 reused=len(c.observed)-downloaded
                 if downloaded:st.session_state.pop('cache_backup',None)
-                st.session_state['speed_note']=f'本次實際下載{downloaded}次、快取命中{reused}次。歷史資料未強制複查時沿用原值；官方更正可勾選複查。'
-                st.session_state['data_note']=f'行情與籌碼評分日：{dates[-1]}；三日：'+ '、'.join(map(str,dates))+f'；首頁排名日：{rankday}；基本面為本次可取得最新快照。'
+                st.session_state['speed_note']=f'本次成功下載{downloaded}次、失敗嘗試{len(c.failures)}次、快取命中{reused}次。歷史資料未強制複查時沿用原值；官方更正可勾選複查。'
+                st.session_state['data_note']=f'行情與籌碼基準日：{dates[-1]}；三日收盤：'+ '、'.join(map(str,dates))+(f'；首頁排名日：{rankday}' if not intraday_one else '；盤中預估與收盤結果分開顯示')+'；基本面為本次可取得最新快照。'
             notice.success('計算完成；缺資料的標的會明確報錯，不自行填分。')
         except (SourceError,ValueError,KeyError,requests.RequestException) as exc:
             notice.error(str(exc))
+        finally:
+            st.session_state['network_errors']=c.failures
+            st.session_state['sources']=c.observed
+    if 'intraday_output' in st.session_state:
+        display_intraday(*st.session_state['intraday_output'])
+    if st.session_state.get('network_errors'):
+        with st.expander('本次暫時連線失敗紀錄（可能已重試成功）'):
+            st.dataframe(pd.DataFrame(st.session_state['network_errors']),hide_index=True)
     if 'outputs' in st.session_state:
         st.info(st.session_state.get('data_note',''))
         st.caption(st.session_state.get('speed_note',''))

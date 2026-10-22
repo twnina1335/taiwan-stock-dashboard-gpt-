@@ -16,7 +16,7 @@ API='https://openapi.twse.com.tw/v1'
 RWD='https://www.twse.com.tw/rwd/zh'
 HOME='https://www.twse.com.tw/res/data/zh/home/values.json'
 WEIGHTS={'M':10,'I':15,'F':23,'V':5,'T':22,'L':10,'H':5,'R':10}
-MODEL_VERSION='V5-Intraday-Preview'
+MODEL_VERSION='V5.1-Compact-Definitions'
 MAX_STOP_PCT=.08
 MAX_ENTRY_EXTENSION_ATR=3.0
 MIN_PULLBACK_RR=2.0
@@ -251,8 +251,10 @@ def lists(client,companies,funds):
     popular=d.dropna(subset=['定期定額戶數']).sort_values('定期定額戶數',ascending=False).head(15)
     if len(popular)!=15:raise SourceError('定期定額ETF不足15檔')
     popular=popular[['code','name','定期定額戶數']].copy();popular['定期定額名次']=range(1,16)
-    popular['來源']='定期定額前15';moved['來源']='首頁市值榜移入'
-    etfs=merge_etfs(popular,moved)
+    popular['來源']='定期定額前15'
+    # 首頁榜ETF只從第二區排除，不額外加入第三區。獨立入選定期定額榜者仍保留。
+    etfs=popular.drop_duplicates('code',keep='first').reset_index(drop=True)
+    if len(etfs)!=15:raise SourceError('定期定額排行代碼重複，未取得15檔唯一ETF。')
     return stocks,etfs,day
 
 def merge_etfs(popular,moved):
@@ -654,6 +656,34 @@ def stock_score(code,dt,prices,index,companies,rev,profit,val,flow):
                  '未持有':buy,'已持有':hold})
     return total,parts,meta
 
+
+def etf_interpretation(hist,technical,parts):
+    """ETF價量條件的自訂觀察提示，不冒充產品風險／個人持倉判斷。"""
+    x=hist.sort_values('date').iloc[-1]
+    extension=float(abs(x.adj_close-x.ma20)/x.atr) if x.atr>0 else float('inf')
+    volatility=float(x.atr/x.adj_close)
+    if x.adj_close<=x.ma60 and x.ma20<=x.ma60:
+        buy,hold,why,case='暫不進場','減碼評估','低於季線，月線未高於季線','趨勢偏弱'
+    elif x.adj_close<=x.ma60:
+        buy,hold,why,case='等待站回季線','檢查原停損','價格跌到季線下方','季線失守'
+    elif x.adj_close<=x.ma20:
+        buy,hold,why,case='等待止跌回升','續抱檢查','季線上方，但尚未站回月線','回檔觀察'
+    elif extension>3:
+        buy,hold,why,case='等待回檔','續抱，暫不追價','高於月線超過3ATR，位置偏遠','乖離偏大'
+    elif volatility>.04:
+        buy,hold,why,case='先觀察波動','檢查部位風險','ATR超過價格4%，波動較大','波動偏高'
+    elif technical>=75 and parts['趨勢']>=75 and parts['動能']>=75:
+        buy,hold,why,case='可分批評估','續抱觀察','技術強度、趨勢與動能均達75，距月線未過遠','技術較強'
+    elif technical>=60:
+        buy,hold,why,case='等待轉強','續抱檢查','價格守住均線，但價量條件尚未齊','轉強待確認'
+    else:
+        buy,hold,why,case='先觀察','檢查持有理由','技術強度低於60，價量支持較少','技術支持較少'
+    return {'未持有':buy,'已持有':hold,'判讀原因':why,'ETF情境':case,
+            '距月線ATR':round(extension,2),'收盤':float(x.close),
+            '月線參考價':round(float(x.ma20*x.close/x.adj_close),2),
+            '季線參考價':round(float(x.ma60*x.close/x.adj_close),2)}
+
+
 def etf_score(code,dt,prices):
     a=prices[(prices.code==code)&(prices.date<=dt)].sort_values('date')
     if len(a)<81 or a.date.iloc[-1]!=dt:raise SourceError('ETF歷史有效比較價不足81日或無當日價格')
@@ -668,7 +698,7 @@ def etf_score(code,dt,prices):
     total=round(.4*trend+.25*momentum+.2*liquidity+.15*stability,2)
     technical=round((.4*trend+.25*momentum+.2*liquidity)/.85,2)
     return total,parts,{'模型版本':MODEL_VERSION,'ETF技術強度':technical,'波動ATR%':round(float(atr)*100,2),
-                       '未持有':'ETF技術強度與波動分開觀察','已持有':'另查淨值折溢價與產品風險'}
+                       **etf_interpretation(a,technical,parts)}
 
 def batch(rows,dates,prices,index,context,is_etf=False):
     companies,rev,profit,val,flow=context
@@ -689,41 +719,59 @@ def batch(rows,dates,prices,index,context,is_etf=False):
                 for k in ['模型版本','股票強度','進場位置','風控結果','突破延續符合數','突破前整理','量能規則','創高觀察','評估路徑','突破基準價','突破站穩','回測承接','參考停損','移動保護參考價','未符合條件','風控未符合']:
                     record[k]=meta.get(k)
             else:
-                for k in ['模型版本','ETF技術強度','波動ATR%']:record[k]=meta.get(k)
+                for k in ['模型版本','ETF技術強度','波動ATR%','判讀原因','ETF情境','距月線ATR','月線參考價','季線參考價']:record[k]=meta.get(k)
         except (SourceError,KeyError,ValueError) as exc:
             record.update({'狀態':'無法評分','錯誤':str(exc)})
         results.append(record)
     return pd.DataFrame(results),pd.DataFrame(detail)
 
+def compact_results(table):
+    """只收斂預設展示欄位，完整結果仍用於明細與CSV。"""
+    columns=['code','name','股票強度','ETF技術強度','強度三日圖','近三日強度平均','強度狀態','未持有','已持有']
+    if 'ETF技術強度' in table:columns.append('判讀原因')
+    if '錯誤' in table and table['錯誤'].notna().any():columns+=['狀態','錯誤']
+    view=table[[k for k in columns if k in table]].copy()
+    short={'強度高，但大盤／趨勢門檻未齊':'大盤／趨勢未齊','突破已確認，延續證據較少，觀察':'突破證據不足',
+           '回檔位置可評估，等待止跌':'等待止跌','趨勢延續，等待整理或回檔':'等待整理／回檔',
+           '風控未通過，等待':'風控未過','強勢，等待回檔':'強勢待回檔','突破待確認，等待收盤站穩':'突破待確認',
+           '尚無進場型態，觀察':'型態待確認','突破失敗，暫不追價':'突破失敗，勿追價',
+           '檢查原停損與交易理由；不因警示一律賣出':'檢查原停損',
+           '核對原停損／移動保護價；不以高分抵銷':'檢查保護價',
+           '續抱檢查；加碼須另通過位置與風控':'續抱，另評估加碼',
+           '續抱檢查原停損與移動保護價':'檢查原停損／保護價',
+           '觀察收盤回升與MA20附近承接':'觀察月線承接','依趨勢與原停損檢查':'檢查趨勢／停損'}
+    for col in ['未持有','已持有']:
+        if col in view:view[col]=view[col].replace(short)
+    return view
+
+
 def display_results(table,detail,key):
-    if table.empty:st.info('本區沒有標的');return
-    priority=['code','name','股票強度','ETF技術強度','強度三日圖','近三日強度平均','強度狀態','進場位置','風控結果','創高觀察','評估路徑','當日分數','三日圖','近三日平均','狀態','未持有','已持有']
-    table=table[[k for k in priority if k in table]+[k for k in table if k not in priority]]
-    st.dataframe(table,use_container_width=True,hide_index=True,column_config={
-        '強度三日圖':st.column_config.LineChartColumn('近三日強度升降溫',y_min=0,y_max=100,width='medium'),
-        '三日圖':st.column_config.LineChartColumn('近三日綜合分',y_min=0,y_max=100,width='medium'),
-        '當日分數':st.column_config.NumberColumn('八面向綜合分／ETF綜合分',format='%.2f'),
-        '股票強度':st.column_config.NumberColumn('股票強度（進場分級依此）',format='%.2f'),
-        'ETF技術強度':st.column_config.NumberColumn(format='%.2f'),
-        '近三日平均':st.column_config.NumberColumn('近三日綜合分平均',format='%.2f'),
-        '近三日強度平均':st.column_config.NumberColumn(format='%.2f'),
-        '狀態':st.column_config.TextColumn('綜合分狀態')})
-    export=table.drop(columns=['三日圖','強度三日圖'],errors='ignore')
-    st.download_button('下載本區CSV',export.to_csv(index=False).encode('utf-8-sig'),file_name=key+'.csv',key=key+'_csv')
-    if not detail.empty:
-        with st.expander('八面向／ETF分項、價格與資料日期'):
-            code=st.selectbox('選擇代碼',list(dict.fromkeys(detail['代碼'])),key=key+'_select')
-            chosen=detail[detail['代碼']==code]
-            if '創高觀察' in chosen:
-                latest=chosen.iloc[-1]
-                st.write('最新創高觀察：'+str(latest['創高觀察'])+'｜'+str(latest['評估路徑']))
-                st.caption('延續條件未符合：'+(str(latest.get('未符合條件','')) or '無')+'；風控未符合：'+(str(latest.get('風控未符合','')) or '無'))
-            strength_column='股票強度' if '股票強度' in chosen else 'ETF技術強度'
-            chart=alt.Chart(chosen.assign(日期=pd.to_datetime(chosen['日期']))).mark_line(point=True).encode(
-                x=alt.X('日期:T',title='評分日期'),y=alt.Y(strength_column+':Q',scale=alt.Scale(domain=[0,100])),tooltip=['日期:T',strength_column+':Q','總分:Q'])
-            st.altair_chart(chart,use_container_width=True)
-            st.dataframe(chosen,hide_index=True,use_container_width=True)
-            st.download_button('下載分項CSV',detail.to_csv(index=False).encode('utf-8-sig'),file_name=key+'_detail.csv',key=key+'_detail')
+    if table.empty:st.caption('本區沒有標的');return
+    st.dataframe(compact_results(table),use_container_width=True,hide_index=True,column_config={
+        'code':st.column_config.TextColumn('代碼',width='small'),
+        'name':st.column_config.TextColumn('名稱'),
+        '強度三日圖':st.column_config.LineChartColumn('三日強度',y_min=0,y_max=100,width='small'),
+        '股票強度':st.column_config.NumberColumn('強度',format='%.2f'),
+        'ETF技術強度':st.column_config.NumberColumn('強度',format='%.2f'),
+        '近三日強度平均':st.column_config.NumberColumn('三日均分',format='%.2f'),
+        '強度狀態':st.column_config.TextColumn('溫度')})
+    if 'ETF技術強度' in table:st.caption('ETF提示僅依價量；折溢價與產品風險未納入。')
+    with st.expander('明細與下載'):
+        export=table.drop(columns=['三日圖','強度三日圖'],errors='ignore')
+        st.download_button('下載結果CSV',export.to_csv(index=False).encode('utf-8-sig'),file_name=key+'.csv',key=key+'_csv')
+        if detail.empty:return
+        code=st.selectbox('代碼',list(dict.fromkeys(detail['代碼'])),key=key+'_select')
+        chosen=detail[detail['代碼']==code];latest=chosen.iloc[-1]
+        if '股票強度' in chosen:
+            st.caption('型態：'+str(latest.get('評估路徑',''))+'｜位置：'+str(latest.get('進場位置',''))+'｜風控：'+str(latest.get('風控結果','')))
+            st.caption('未符合：'+(str(latest.get('未符合條件','')) or '無')+'；風控：'+(str(latest.get('風控未符合','')) or '無'))
+        else:st.caption('原因：'+str(latest.get('判讀原因','')))
+        strength_column='股票強度' if '股票強度' in chosen else 'ETF技術強度'
+        chart=alt.Chart(chosen.assign(日期=pd.to_datetime(chosen['日期']))).mark_line(point=True).encode(
+            x=alt.X('日期:T',title='日期'),y=alt.Y(strength_column+':Q',scale=alt.Scale(domain=[0,100])),tooltip=['日期:T',strength_column+':Q','總分:Q'])
+        st.altair_chart(chart,use_container_width=True)
+        st.dataframe(chosen,hide_index=True,use_container_width=True)
+        st.download_button('下載分項CSV',detail.to_csv(index=False).encode('utf-8-sig'),file_name=key+'_detail.csv',key=key+'_detail')
 
 # 盤中只查單檔；MIS為公開網站報價回應，非具可用性承諾的OpenAPI。
 MIS='https://mis.twse.com.tw/stock/api/getStockInfo.jsp'
@@ -895,44 +943,192 @@ def intraday_estimate(code,dt,prices,index,context,quote,is_etf=False):
 
 
 def display_intraday(result,detail):
-    st.subheader('第一區｜盤中預估（獨立於三日收盤圖）')
-    st.caption('這是上次按下盤中預估時的快照，不會自動更新；報價落後秒數以當次查詢時計。請核對下方報價時間。')
+    st.caption('盤中快照｜'+result['報價時間']+'｜'+result['時段'])
     stamp=datetime.fromisoformat(result['報價時間'])
-    snapshot_age=(datetime.now(ZoneInfo('Asia/Taipei'))-stamp).total_seconds()
-    if snapshot_age>180:
-        st.warning(f'這份報價距現在約{snapshot_age/60:.1f}分鐘；可能為舊快照或集合競價期間最後成交，請勿當作目前即時狀態。')
-    st.warning('非即時交易等級資訊、非收盤確認。大盤／同業／法人採前收盤，最新基本面與估值另有資料日期；不把混合時間的估分稱為全市場即時評分。')
+    age=(datetime.now(ZoneInfo('Asia/Taipei'))-stamp).total_seconds()
+    if age>180:st.warning(f'快照距現在{age/60:.1f}分鐘，請刷新後再判讀。')
     st.write('**'+result['觀察結論']+'**')
     a,b,c=st.columns(3)
-    a.metric('盤中強度：量能情境區間',f"{result['強度下緣']:.2f}–{result['強度上緣']:.2f}")
+    a.metric('暫估強度區間',f"{result['強度下緣']:.2f}–{result['強度上緣']:.2f}")
     b.metric('前收盤強度',f"{result['前收盤強度']:.2f}")
-    c.metric('最後成交價',str(result['最後成交價']))
-    st.caption('報價時間：'+result['報價時間']+'｜'+result['時段']+'｜收盤基準：'+result['收盤基準日'])
-    st.info(result['區間定義'])
-    st.caption(result['量能說明'])
-    st.dataframe(detail,hide_index=True,use_container_width=True)
-    with st.expander('盤中價位、量能、資料時間與限制'):
+    c.metric('最後成交',str(result['最後成交價']))
+    st.caption('固定現價的量能情境，非收盤預測；不會自動更新。')
+    with st.expander('盤中明細與下載'):
+        st.info('尚未收盤確認。大盤／同業／法人沿用收盤基準；基本面、估值另有快照日期。')
+        st.caption(result['區間定義']);st.caption(result['量能說明'])
+        st.dataframe(detail,hide_index=True,use_container_width=True)
         st.dataframe(pd.DataFrame([result]),hide_index=True,use_container_width=True)
-    st.download_button('下載盤中預估CSV',pd.DataFrame([result]).to_csv(index=False).encode('utf-8-sig'),file_name='intraday_estimate.csv',key='intraday_csv')
+        st.download_button('下載盤中CSV',pd.DataFrame([result]).to_csv(index=False).encode('utf-8-sig'),file_name='intraday_estimate.csv',key='intraday_csv')
+
+
+def display_definitions():
+    """所有定義內嵌在app.py，展開即可查閱，不依賴另傳README。"""
+    content={
+    '股票分數':r'''
+**分數不是勝率。** 八面向綜合分包含進場品質R；股票強度排除R，兩者皆0–100。
+
+- 綜合分＝0.10M＋0.15I＋0.23F＋0.05V＋0.22T＋0.10L＋0.05H＋0.10R。
+- 股票強度＝(10M＋15I＋23F＋5V＋22T＋10L＋5H)÷90。
+- M／I／F／V／T／L／H各有四項條件，每符合一項25分。R另按下頁規則計算。
+
+| 面向／原權重 | 每項25分的實際條件 |
+|---|---|
+| M 大盤 10% | 加權指數>MA60；MA20>MA60；MA60高於20交易日前；超過50%有效上市樣本>MA60 |
+| I 產業 15% | 排除本股的同業20日報酬中位數勝大盤；60日報酬中位數勝大盤；超過50%同業>MA60；同業60日報酬中位數>0 |
+| F 營運 23% | 最新單月營收年增>0；累計營收年增>0；單月年增>累計年增；營業利益率>0（金融業固定改用基本EPS>0） |
+| V 估值 5% | 正值PE低於有效同業中位數／25百分位；正值PB低於有效同業中位數／25百分位。金融業或PE不適用，固定改用PB比較同業75／50／25／10百分位 |
+| T 趨勢 22% | 比較收盤>MA60；MA20>MA60；60日報酬勝大盤；MA20高於20交易日前。距均線遠近不在T扣分 |
+| H 籌碼 5% | 外資20日淨買超>0；投信20日>0；兩者合計5日>0；兩者合計20日淨買超股數÷20日成交股數≥1% |
+
+**L量能（10%）：共同兩項＋路徑兩項。**
+
+共同：20日均成交金額≥1億元；近20日每天都有成交。
+
+| 路徑 | 另兩項條件（各25分） |
+|---|---|
+| 回檔型 | 20日下跌日均量<上漲日均量；最近5交易日下跌日均量<此前20日均量。沒有下跌日不憑空給量縮分 |
+| 突破型 | 5日均成交金額≥20日均額；突破日量≥突破前20日均量1.2倍 |
+| 其他型態 | 5日均額≥20日；20日上漲日均量>下跌日均量 |
+
+**資料要求：** 至少81個有效行情交易日；大盤廣度至少300家、有效同業至少3家；法人近20日完整；估值需足夠正值同業。缺必要資料即無法評分，不用0補缺。官方同業分類不保證商業模式相同。F／V用最新公開快照，不是預估EPS或券商目標價。
+''',
+    '位置與風控':r'''
+**先分型態，再看位置與風控；強度高不表示現在適合買。**
+
+| 型態 | 程式定義 |
+|---|---|
+| 突破型 | 已載入歷史中，收盤突破其此前60日高點、前一收盤不高於基準；基準鎖定，後續收盤跌回其下才失效 |
+| 回檔型 | 無有效突破；價格>MA60、MA20>MA60且MA20上升；距最近20日高點回落≥0.5ATR，距MA20≤2ATR |
+| 趨勢延續型 | 符合上升趨勢，但未形成上述回檔位置或可辨識突破事件；等待整理／回檔，不自動列候選 |
+| 盤整／弱勢 | 其餘型態，尚無本模型認定的進場型態 |
+
+突破收盤確認：包含事件日在內，至少兩個連續收盤守住基準。近期5交易日失敗警示優先處理；不因警示一律賣出。
+
+**突破延續四項證據：** MA20>MA60且兩者都高於20日前；20／60日報酬都勝大盤與同業；突破量≥前20日均量1.2倍；突破收盤位於當日高低區間上方30%。符合0–1項觀察；2項最多試單；3–4項按強度分級。F不再額外否決突破。
+
+**整理條件：** 事件前10日高低區間≤4個事件前一日ATR，且事件前5日平均ATR≤前20日平均ATR。未符合仍可列候選，但最高到分批建倉。量縮回測後回升另列觀察，不是必要條件：觸及基準上方0.5事件ATR以內、收盤守住、量低於事件量與此前20日均量，之後另一天收盤高於回測日收盤。
+
+**停損與目標：**
+
+- 突破初始停損＝突破價−0.5個突破日ATR。移動保護價取初始停損與事件後各日前10日低點−0.5個前日ATR的最大值；新進場參考停損採此保護價。
+- 其他型態停損＝此前20日低點−0.5個當日ATR。
+- 只有回檔型使用此前60日高點為參考目標，且須高於進場價；其他型態不虛構上方目標或RR。
+- 示範進場價＝評分日收盤。成本＝進場價×(2×0.1425%＋0.3%＋0.1%)；為簡化手續費、稅與往返滑價假設。
+- 扣成本RR＝(目標−進場−成本)÷(進場−停損＋成本)。RR是參考盈虧比例，不是預期報酬或勝率。
+
+**R進場品質＝風險距離分50%＋位置分50%。** 停損無效則R=0，可出現12.5分間距。
+
+| 子分數 | 定義 |
+|---|---|
+| 風險距離分 | 停損距離≤2ATR得100、≤3得75、≤4得50、其他0 |
+| 回檔位置分 | RR≥3得100、≥2得75、≥1.5得50、≥1得25、其他／無目標0 |
+| 突破／延續位置分 | 現價距MA20≤2ATR得100、≤3得75、≤4得50、其他0 |
+| 盤整／弱勢位置分 | 0 |
+
+| 位置／風控文字 | 真正意義 |
+|---|---|
+| 位置可評估 | 突破／延續距MA20≤3ATR，不代表便宜或可直接買；延續型仍可能沒有買點 |
+| 回檔位置可評估 | 扣成本RR≥2，仍須收盤高於前日且≥MA20−0.5ATR作為止跌確認 |
+| 離均線偏遠 | 距MA20>3ATR |
+| 上方空間不足 | 回檔RR<2或無有效上方目標 |
+| 風控通過 | 有效停損低於現價、ATR有效、停損距離≤進場價8%，且現價高於適用移動保護價；不代表保證可在停損價成交 |
+
+**個股分級（依股票強度，不依綜合分）：** <60不進場／退出評估；60–<70不進場／減碼評估；70–<80觀察／續抱檢查；80–<85試單；85–<90分批建倉；≥90標準建倉候選。80以上仍須M≥50、T≥75、有效型態、位置與風控通過，突破另受確認與證據等級限制；F／R無75分否決門檻。
+
+候選不是下單指令，「標準建倉」不是滿倉；持有提示沒有使用你的成本與部位。程式不保存真實持倉停損，不應因新報表而放寬原停損。事件只在已載入、具有60日前史的日期中辨識，資料窗口移動可能改變事件。
+''',
+    'ETF':r'''
+**ETF與股票不能直接比強度。** ETF只看價量；股票還含營運、估值、大盤、同業與法人。
+
+- ETF綜合分＝趨勢40%＋動能25%＋量能20%＋價格穩定15%。
+- ETF技術強度＝(40×趨勢＋25×動能＋20×量能)÷85；排除穩定分，避免把低波動直接當成更值得買。
+- 四面向各四條件，每條25分；ATR波動%＝ATR14÷比較收盤×100%。
+
+| 面向 | 四項條件 |
+|---|---|
+| 趨勢 | 價格>MA20；價格>MA60；MA20>MA60；MA60高於20日前 |
+| 動能 | 20日報酬>0；60日報酬>0；價格>最近20日收盤中位數；價格>最近60日收盤中位數 |
+| 量能 | 20日均額≥1億元；≥5億元；5日均額≥20日；上漲日均量>下跌日均量 |
+| 價格穩定 | ATR／價格≤4%、≤3%、≤2%、≤1%，各25分 |
+
+**未持有／已持有依下表由上往下判斷，第一個符合就採用。** 這是本程式自訂技術提示，未回測校準，不套股票M／F／R門檻。
+
+| 條件 | 未持有 | 已持有 | 意義 |
+|---|---|---|---|
+| 價格≤MA60且MA20≤MA60 | 暫不進場 | 減碼評估 | 趨勢偏弱；評估不等於自動賣出 |
+| 其他價格≤MA60 | 等待站回季線 | 檢查原停損 | 長均線失守 |
+| 價格>MA60但≤MA20 | 等待止跌回升 | 續抱檢查 | 趨勢中回檔，尚未站回月線 |
+| 高於MA20超過3ATR | 等待回檔 | 續抱，暫不追價 | 強勢可能仍在，但進場位置偏遠 |
+| ATR／價格>4% | 先觀察波動 | 檢查部位風險 | 不把高波動直接當成必須賣出 |
+| 技術強度、趨勢、動能均≥75 | 可分批評估 | 續抱觀察 | 價量較強且未過度乖離，仍不是完整產品買進建議 |
+| 其餘技術強度≥60 | 等待轉強 | 續抱檢查 | 價量條件尚未齊 |
+| 其餘 | 先觀察 | 檢查持有理由 | 技術支持較少 |
+
+「判讀原因」會列出實際符合的那一項。**沒有納入淨值折溢價、追蹤誤差、匯率、久期、信用、槓反每日重設等產品風險**；已持有提示也沒有取得你的成本、持有期間或部位。不同類型ETF不能只按強度決定買賣。
+
+[證交所ETF風險說明](https://www.twse.com.tw/zh/products/securities/etf/overview/introduction.html)
+
+**第三區名單：** 僅依官方定期定額交易戶數排行前15檔。不是所有散戶買進量前15，也不是熱門度預測。首頁市值榜ETF不再額外加入；若它本來就在定期定額前15，仍按該榜獨立保留。
+''',
+    '盤中與名詞':r'''
+**基礎名詞**
+
+| 項目 | 定義 |
+|---|---|
+| MA20／月線 | 最近20交易日比較收盤價的算術平均 |
+| MA60／季線 | 最近60交易日比較收盤價的算術平均 |
+| 20／60日報酬 | 現在比較收盤÷20／60交易日前比較收盤−1 |
+| TR真實波幅 | 當日高−低、abs(高−前收)、abs(低−前收)三者最大值 |
+| ATR14 | 首14筆TR平均作種子，此後(前ATR×13＋本日TR)÷14；Wilder算法。有限歷史暖機可能與其他平台不同 |
+| 距月線ATR | abs(現價−MA20)÷ATR；比較價格與ATR採同一尺度 |
+| 中位數／百分位 | 同業或期間資料的排序中間值／指定分位，不是平均值；V僅使用有效正值同業 |
+| 成交均額／均量 | 對指定交易日成交金額／股數取算術平均；5／20日不等於日曆日 |
+| 比較價 | 由官方收盤／參考價變化串接重建，用來減少參考價重設斷點；不是官方還原股價或含息總報酬 |
+| 三日均分 | 最近三個已取得交易日強度的算術平均，與綜合分平均不同 |
+| 三日溫度 | 最高最低差≤2先判持平；其餘依序不下降為升溫、不上升為降溫；其他按最後一日較前一日變化判回升／回落 |
+
+**盤中預估**
+
+- 第一區單檔、一般盤中09:00–13:30手動查詢，報價快取60秒，不自動輪詢。一般時段接受成交時間落後≤180秒；收盤集合競價期間≤420秒。這是程式門檻，不是來源延遲承諾。
+- 今日部分日K用成交價與日內OHLC；暫估MA納入今天，但ATR固定前一完整日，避免半日波幅低估風險。
+- M／I／H用前收盤；F／V用最新快照，V不按盤中股價重估；T三項隨盤中更新，相對大盤那一項維持前收盤同日對照；R用當下位置與前收盤ATR。
+- 累計量／20日全天均量只表示已成交量達到歷史整天量的比例。沒有可靠同時段歷史，不線性推估全天量、不因早盤量小就斷言量縮。
+- L已證明成立項固定25；未定項給0–25可變範圍。日內低價×累計股數僅作已發生成交金額下界，不冒充精確成交額；回檔量價關係仍待收盤。
+- 強度區間固定當前價格與其他資料，只讓未定量能項變動；上界可較鬆，不是收盤預測、信賴區間或勝率。股票排除R、ETF排除穩定分的定義不變。
+- 今日突破只標盤中觸發，不增加已收盤確認天數。09:00–09:30只觀察，13:25後等待實際收盤；盤中跌破不冒稱已收盤失敗。盤中快照不插入三日收盤圖。
+- 不用買賣掛單／試撮／昨收替代缺少的成交價。日期不對、報價過舊、無有效成交或昨參考價不符就停止。這不是完整公司行動或交易日曆驗證。
+
+**資料與操作**
+
+行情與法人按各評分日截取；F／V及公司分類共用最新快照，所以三日是重估，不是歷史當時資訊回測。正常收盤查詢當天21:00以前排除今天，仍需來源已發布。
+
+首頁只取原始20筆；第二區排除ETF、不補名額。第三區只取定期定額戶數前15，不額外加入首頁ETF。必要資料不足會顯示錯誤。
+
+連線最小間隔15秒、每日200次是程式保護設定，不是官方保證安全門檻。暫時性連線失敗最多三次嘗試；403／429停止。歷史快取沿用，官方更正可勾選複查；data_cache.zip僅為備份，不會自動寫回GitHub。盤中來源為官網公開報價回應，雲端可用性未保證。
+
+所有參數與判讀是自訂規則，未完成策略回測；不代表上漲機率或保證報酬。
+'''}
+    with st.expander('計算定義與判讀說明'):
+        tabs=st.tabs(list(content))
+        for tab,text in zip(tabs,content.values()):
+            with tab:st.markdown(text)
 
 
 def main():
     st.set_page_config(page_title='台股波段｜公開免費版',layout='wide')
     if st.session_state.get('model_version')!=MODEL_VERSION:
         st.session_state.pop('outputs',None);st.session_state.pop('intraday_output',None);st.session_state['model_version']=MODEL_VERSION
-    st.title('台股波段｜公開免費官方資料版')
-    st.caption('V5｜股票強度、進場位置、風控分開。八面向權重保留；進場分級改依不含R的股票強度。未回測，分數不代表勝率。')
-    st.info('先看股票強度，再看型態、位置與風控。F與R不再有75分否決門檻；突破量價證據用於分級。綜合分與股票強度不同，新舊分數不可直接比較。')
-    st.caption('T只評趨勢；回檔量縮與突破放量分開計分。ATR改用Wilder14。股價過熱不直接視為賣出；實際持倉須核對原停損。')
-    st.warning('三日個股分數為「以最新公開基本面與估值橫截面重估」：不是當時已知資訊的歷史回測。比較價依官方收盤價及參考價重建，不是供應商總報酬還原價。')
+    st.markdown("<style>h1{font-size:1.5rem!important}h2{font-size:1.2rem!important}h3{font-size:1.1rem!important}h4{font-size:1.03rem!important}[data-testid='stMetricValue']{font-size:1.35rem!important}</style>",unsafe_allow_html=True)
+    st.markdown('### 台股波段')
+    st.caption('強度・買點・風控｜盤中暫估與收盤結果分開。未回測，分數非勝率。')
+    display_definitions()
     with st.sidebar:
-        st.header('查詢設定')
+        st.markdown('#### 查詢設定')
         cutoff=st.date_input('資料截止日',value=today(),max_value=today())
         offline=st.checkbox('只用本機快取',value=False)
         refresh_recent=st.checkbox('複查最近7日官方更正（會重新下載）',value=False)
-        st.caption('首次建立85日資料仍較久；已有快取時，只下載缺少日期。支援上市股票與ETF。')
-        st.caption('所有請求至少間隔15秒、每日最多200次；遇限制立即停止。不能保證IP不被來源限制。')
-        st.caption('資料來源：證交所官方OpenAPI與官網公開JSON；原始資料皆會快取，不需手動證據CSV。')
+        st.caption('支援上市股票／ETF；首次下載較久。')
+        st.caption('快取優先；間隔15秒／每日200次為程式設定。')
         st.link_button('官方OpenAPI文件','https://openapi.twse.com.tw/')
     c=Client(offline)
     with st.sidebar:
@@ -951,18 +1147,21 @@ def main():
                 except SourceError as exc:st.error(str(exc))
             if 'cache_backup' in st.session_state:
                 st.download_button('下載data_cache.zip',st.session_state['cache_backup'],file_name='data_cache.zip',mime='application/zip')
-    st.subheader('第一區｜股票中文名稱／代碼')
+    st.markdown('#### 第一區｜自選股票／ETF')
     query=st.text_input('上市股票完整簡稱或代碼，例如台積電、2330')
     one=st.button('計算這一檔（收盤）')
-    intraday_one=st.button('盤中預估這一檔（手動刷新，報價快取60秒）')
-    st.caption('盤中預估僅第一區單檔；第二、三區維持收盤評分。不自動輪詢，未接可靠同時段歷史量之前，不以線性放大量當作全天量。')
+    intraday_one=st.button('盤中預估')
+    st.caption('盤中單檔手動刷新，快取60秒。')
+    one_slot=st.container()
     single=one or intraday_one
-    st.subheader('第二區｜首頁市值榜20筆中的非ETF')
-    st.caption('直接取首頁原榜，保留名次與日期；ETF移到第三區，不補名額。')
-    both=st.button('更新第二區與第三區')
-    st.subheader('第三區｜定期定額前15 ETF＋首頁榜移入ETF')
-    st.caption('按代碼合併去重。保留ETF綜合分，另列排除穩定分的ETF技術強度與ATR波動%；不同產品風險不可只按綜合分比較。')
-    only_etf=st.button('僅更新第三區')
+    st.markdown('#### 第二區｜市值榜股票')
+    st.caption('原榜20筆排除ETF，不補名額。')
+    both=st.button('更新第二、三區')
+    second_slot=st.container()
+    st.markdown('#### 第三區｜定期定額ETF前15')
+    st.caption('依交易戶數排名；不額外加入市值榜ETF。')
+    only_etf=st.button('更新第三區')
+    third_slot=st.container()
     if single or both or only_etf:
         notice=st.empty()
         try:
@@ -1017,25 +1216,28 @@ def main():
                 if downloaded:st.session_state.pop('cache_backup',None)
                 st.session_state['speed_note']=f'本次成功下載{downloaded}次、失敗嘗試{len(c.failures)}次、快取命中{reused}次。歷史資料未強制複查時沿用原值；官方更正可勾選複查。'
                 st.session_state['data_note']=f'行情與籌碼基準日：{dates[-1]}；三日收盤：'+ '、'.join(map(str,dates))+(f'；首頁排名日：{rankday}' if not intraday_one else '；盤中預估與收盤結果分開顯示')+'；基本面為本次可取得最新快照。'
-            notice.success('計算完成；缺資料的標的會明確報錯，不自行填分。')
+            notice.success('完成')
         except (SourceError,ValueError,KeyError,requests.RequestException) as exc:
             notice.error(str(exc))
         finally:
             st.session_state['network_errors']=c.failures
             st.session_state['sources']=c.observed
     if 'intraday_output' in st.session_state:
-        display_intraday(*st.session_state['intraday_output'])
+        with one_slot:display_intraday(*st.session_state['intraday_output'])
     if st.session_state.get('network_errors'):
         with st.expander('本次暫時連線失敗紀錄（可能已重試成功）'):
             st.dataframe(pd.DataFrame(st.session_state['network_errors']),hide_index=True)
     if 'outputs' in st.session_state:
-        st.info(st.session_state.get('data_note',''))
-        st.caption(st.session_state.get('speed_note',''))
-        with st.expander('來源與快取擷取時間'):
-            st.dataframe(pd.DataFrame(st.session_state.get('sources',[])),hide_index=True)
-        st.caption('強度三日圖為主要觀察；綜合分另列，兩者均0–100。🔴升溫　🔵降溫　⚪持平　🟠回升　🟣回落；持平＝三日最高最低差≤2分。所有圖固定0–100分。')
+        slots={'第一區':one_slot,'第二區':second_slot,'第三區':third_slot}
         for key,(table,detail) in st.session_state.outputs.items():
-            st.subheader(key+'結果（修改設定後須重新計算）')
-            display_results(table,detail,key)
+            with slots[key]:
+                if not table.empty and '評分日' in table:
+                    days=table['評分日'].dropna()
+                    if len(days):st.caption('收盤基準：'+str(days.iloc[0]))
+                display_results(table,detail,key)
+        with st.expander('資料來源與連線紀錄'):
+            st.caption(st.session_state.get('data_note',''))
+            st.caption(st.session_state.get('speed_note',''))
+            st.dataframe(pd.DataFrame(st.session_state.get('sources',[])),hide_index=True)
 
 if __name__=='__main__':main()
